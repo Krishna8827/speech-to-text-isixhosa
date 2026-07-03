@@ -26,7 +26,9 @@ from config import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_INPUT_EXTENSIONS = {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".webm", ".flac"}
+SUPPORTED_INPUT_EXTENSIONS: frozenset[str] = frozenset(
+    {".m4a", ".mp3", ".opus", ".ogg", ".wav", ".webm", ".flac", ".aac"}
+)
 
 
 def setup_logging(log_level: str) -> None:
@@ -36,8 +38,15 @@ def setup_logging(log_level: str) -> None:
         log_level: Logging level name (e.g. ``INFO``, ``DEBUG``).
     """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+
+    if root_logger.handlers:
+        root_logger.setLevel(level)
+        return
+
     logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
+        level=level,
         format=LOG_FORMAT,
         datefmt=LOG_DATE_FORMAT,
         handlers=[
@@ -85,42 +94,115 @@ def preprocess_audio_file(input_path: Path, output_path: Path) -> Path:
 
 
 def discover_audio_files(input_dir: Path) -> list[Path]:
-    """Find supported audio files in a directory.
+    """Find supported audio files under a directory tree.
+
+    Recursively scans ``input_dir`` so nested layouts produced by
+    ``download_audio.py`` (``data/raw/<video_id>/<video_id>.webm``) are
+    discovered alongside any flat files placed directly in ``data/raw/``.
 
     Args:
-        input_dir: Directory to scan for audio files.
+        input_dir: Root directory to scan for audio files.
 
     Returns:
         Sorted list of audio file paths.
     """
+    if not input_dir.is_dir():
+        return []
+
     return sorted(
         path
-        for path in input_dir.iterdir()
+        for path in input_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
     )
 
 
-def preprocess_directory(input_dir: Path, output_dir: Path) -> list[Path]:
-    """Preprocess all supported audio files in a directory.
+def resolve_output_path(
+    input_path: Path,
+    input_root: Path,
+    output_root: Path,
+) -> Path:
+    """Map a raw audio file to its processed WAV output path.
+
+    Preserves YouTube video IDs from the download layout:
+    ``data/raw/<video_id>/<file>`` -> ``data/processed/<video_id>/<video_id>.wav``
+
+    Flat files in ``data/raw/`` continue to map to
+    ``data/processed/<stem>.wav``.
 
     Args:
-        input_dir: Directory containing raw audio files.
+        input_path: Source audio file path.
+        input_root: Root raw-data directory (typically ``data/raw``).
+        output_root: Root processed-data directory (typically ``data/processed``).
+
+    Returns:
+        Destination path for the converted WAV file.
+    """
+    input_path = input_path.resolve()
+    input_root = input_root.resolve()
+    output_root = output_root.resolve()
+
+    try:
+        relative = input_path.relative_to(input_root)
+    except ValueError:
+        return output_root / f"{input_path.stem}.wav"
+
+    # Nested layout from download_audio.py: <video_id>/<filename>.<ext>
+    if len(relative.parts) >= 2:
+        video_id = relative.parts[0]
+        return output_root / video_id / f"{video_id}.wav"
+
+    return output_root / f"{input_path.stem}.wav"
+
+
+def should_skip_processing(input_path: Path, output_path: Path) -> bool:
+    """Return True when an up-to-date processed file already exists.
+
+    Skips re-processing when the output WAV is at least as new as the
+    source file, so re-running the script is safe after partial runs.
+
+    Args:
+        input_path: Source audio file path.
+        output_path: Expected processed WAV path.
+
+    Returns:
+        ``True`` if processing can be skipped.
+    """
+    if not output_path.is_file():
+        return False
+
+    return output_path.stat().st_mtime >= input_path.stat().st_mtime
+
+
+def preprocess_directory(input_dir: Path, output_dir: Path) -> list[Path]:
+    """Preprocess all supported audio files under a directory tree.
+
+    Args:
+        input_dir: Directory containing raw audio files (flat or nested).
         output_dir: Directory where processed WAV files are written.
 
     Returns:
-        List of paths to successfully processed files.
+        List of paths to successfully processed or already-valid WAV files.
     """
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     audio_files = discover_audio_files(input_dir)
     if not audio_files:
-        logger.warning("No supported audio files found in %s", input_dir)
+        logger.warning("No supported audio files found under %s", input_dir)
         return []
 
     processed_paths: list[Path] = []
+    skipped_count = 0
+
     for input_path in audio_files:
-        output_path = output_dir / f"{input_path.stem}.wav"
+        output_path = resolve_output_path(input_path, input_dir, output_dir)
+
+        if should_skip_processing(input_path, output_path):
+            logger.info("Skipping up-to-date file: %s", output_path)
+            processed_paths.append(output_path)
+            skipped_count += 1
+            continue
+
         try:
             processed_paths.append(
                 preprocess_audio_file(input_path, output_path),
@@ -128,9 +210,12 @@ def preprocess_directory(input_dir: Path, output_dir: Path) -> list[Path]:
         except Exception:
             logger.exception("Failed to preprocess %s", input_path)
 
+    newly_processed = len(processed_paths) - skipped_count
     logger.info(
-        "Preprocessed %d of %d file(s).",
-        len(processed_paths),
+        "Preprocessed %d file(s), skipped %d up-to-date file(s), "
+        "out of %d source file(s).",
+        newly_processed,
+        skipped_count,
         len(audio_files),
     )
     return processed_paths
@@ -178,8 +263,15 @@ def main() -> None:
 
     try:
         if args.input is not None:
-            output_path = args.output_dir / f"{args.input.stem}.wav"
-            preprocess_audio_file(args.input, output_path)
+            output_path = resolve_output_path(
+                args.input,
+                args.input_dir,
+                args.output_dir,
+            )
+            if should_skip_processing(args.input, output_path):
+                logger.info("Skipping up-to-date file: %s", output_path)
+            else:
+                preprocess_audio_file(args.input, output_path)
         else:
             preprocess_directory(args.input_dir, args.output_dir)
     except Exception:
