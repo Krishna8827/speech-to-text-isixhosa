@@ -40,6 +40,8 @@ data/test/*
 # Models and results
 models/*
 !models/.gitkeep
+!models/final/
+!models/final/**
 results/*
 !results/.gitkeep
 
